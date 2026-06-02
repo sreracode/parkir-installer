@@ -104,24 +104,27 @@ function Install-Service($repoName, $nssmPath) {
 
 # ─── Function: Uninstall Service ───────────────────────────────
 $NSSM_SERVICES = @{
-    "parkir-detectionplate" = "ParkirDetectionPlate"
-    "parkir-video-recorder" = "ParkirVideoRecorder"
-    "parkir-qris-display"   = "QrisDisplay"
-    "parkir-webhook-qris"   = $null  # No NSSM (PHP)
-    "parkir-auto-cleanup"   = "ParkirAutoCleanup"
+    "parkir-detectionplate" = @("ParkirDetectionPlate")
+    "parkir-video-recorder" = @("ParkirVideoRecorder")
+    "parkir-qris-display"   = @("QrisDisplay")
+    "parkir-webhook-qris"   = @("ParkirWebhookPHP", "ParkirWebhookTunnel")  # PHP + Cloudflare Tunnel
+    "parkir-auto-cleanup"   = @("ParkirAutoCleanup")
 }
 
 function Uninstall-Service($repoName) {
-    $serviceName = $NSSM_SERVICES[$repoName]
-    if (-not $serviceName) {
+    $serviceNames = $NSSM_SERVICES[$repoName]
+    if (-not $serviceNames -or $serviceNames.Count -eq 0) {
         Write-Host "  ⏭️  $repoName tidak pakai NSSM, skip" -ForegroundColor Yellow
         return
     }
     
-    Write-Host "  🗑️  Menghapus service $serviceName..." -ForegroundColor Red
-    & "C:\nssm\win64\nssm.exe" stop $serviceName 2>&1 | Out-Null
-    & "C:\nssm\win64\nssm.exe" remove $serviceName confirm 2>&1 | Out-Null
-    Write-Host "  ✅ Service $serviceName dihapus" -ForegroundColor Green
+    foreach ($serviceName in $serviceNames) {
+        Write-Host "  🗑️  Menghapus service $serviceName..." -ForegroundColor Red
+        & "C:\nssm\win64\nssm.exe" stop $serviceName 2>&1 | Out-Null
+        Start-Sleep -Milliseconds 500
+        & "C:\nssm\win64\nssm.exe" remove $serviceName confirm 2>&1 | Out-Null
+        Write-Host "  ✅ Service $serviceName dihapus" -ForegroundColor Green
+    }
 }
 
 # ─── MENU ───────────────────────────────────────────────────────
@@ -210,10 +213,12 @@ function Main {
         $ans = Read-Host
         if ($ans -eq "y") {
             foreach ($repo in $REPOS.Keys) {
-                $serviceName = $NSSM_SERVICES[$repo]
-                if ($serviceName) {
-                    & $nssmPath restart $serviceName 2>&1 | Out-Null
-                    Write-Host "  ✅ $serviceName restarted" -ForegroundColor Green
+                $serviceNames = $NSSM_SERVICES[$repo]
+                if ($serviceNames -and $serviceNames.Count -gt 0) {
+                    foreach ($svc in $serviceNames) {
+                        & $nssmPath restart $svc 2>&1 | Out-Null
+                        Write-Host "  ✅ $svc restarted" -ForegroundColor Green
+                    }
                 }
             }
         }
