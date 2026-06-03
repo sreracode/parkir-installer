@@ -1,8 +1,11 @@
 <#
 .SYNOPSIS
-    Parkir Service Master Installer v1.0
+    Parkir Service Master Installer v2.0
 .DESCRIPTION
-    Install, update, dan manage semua service SMARTPARK
+    Install, update, dan manage semua service SMARTPARK.
+    - NSSM & cloudflared auto-download ke SERVICE\tools\
+    - Clone repo langsung ke SERVICE\
+    - Auto venv + pip install + NSSM register
 #>
 
 param(
@@ -14,132 +17,211 @@ $ErrorActionPreference = "Stop"
 
 # ─── Config ────────────────────────────────────────────────────
 $GITHUB_USER = "sreracode"
-$REPOS = @{
-    "parkir-detectionplate" = @{ Name = "Detection Plate"; Type = "SERVER" }
-    "parkir-video-recorder" = @{ Name = "Video Recorder"; Type = "CLIENT" }
-    "parkir-qris-display"   = @{ Name = "QRIS Display";    Type = "CLIENT" }
-    "parkir-webhook-qris"   = @{ Name = "Webhook QRIS";    Type = "SERVER" }
-    "parkir-auto-cleanup"   = @{ Name = "Auto Cleanup";    Type = "SERVER" }
-}
-
 $BASE_DIR = Split-Path -Parent $MyInvocation.MyCommand.Path
-
-# ─── Function: NSSM Check ──────────────────────────────────────
-function Ensure-NSSM {
-    $nssmPaths = @(
-        "$env:ProgramFiles\nssm\win64\nssm.exe",
-        "${env:ProgramFiles(x86)}\nssm\win64\nssm.exe",
-        "C:\nssm\win64\nssm.exe",
-        "$env:LOCALAPPDATA\nssm\win64\nssm.exe"
-    )
-    
-    $existing = $nssmPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($existing) {
-        Write-Host "✅ NSSM ditemukan di: $existing" -ForegroundColor Green
-        return $existing
-    }
-    
-    Write-Host "⚠️ NSSM tidak ditemukan. Download otomatis? (y/N): " -ForegroundColor Yellow -NoNewline
-    $ans = Read-Host
-    if ($ans -ne "y") { return $null }
-    
-    $nssmUrl = "https://nssm.cc/release/nssm-2.24.zip"
-    $zipPath = "$env:TEMP\nssm.zip"
-    $extractPath = "$env:TEMP\nssm-extract"
-    $installDir = "C:\nssm"
-    
-    Write-Host "Downloading NSSM..." -ForegroundColor Cyan
-    Invoke-WebRequest -Uri $nssmUrl -OutFile $zipPath
-    Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
-    New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-    Copy-Item "$extractPath\nssm-2.24\win64\*" "$installDir\win64\" -Recurse -Force
-    Remove-Item $zipPath, $extractPath -Recurse -Force -ErrorAction SilentlyContinue
-    
-    Write-Host "✅ NSSM installed di: C:\nssm\win64\nssm.exe" -ForegroundColor Green
-    return "C:\nssm\win64\nssm.exe"
+$TOOLS_DIR = Join-Path $BASE_DIR "tools"
+$REPOS = @{
+    "parkir-detectionplate" = @{ Name = "Detection Plate"; Type = "SERVER"; Port = 5000; Desc = "ANPR YOLO + OCR" }
+    "parkir-video-recorder" = @{ Name = "Video Recorder"; Type = "CLIENT"; Port = 5050; Desc = "RTSP Recording" }
+    "parkir-qris-display"   = @{ Name = "QRIS Display";    Type = "CLIENT"; Port = 8001; Desc = "QRIS SSE Display" }
+    "parkir-webhook-qris"   = @{ Name = "Webhook QRIS";    Type = "SERVER"; Port = 8090; Desc = "PHP Webhook + Cloudflare Tunnel" }
+    "parkir-auto-cleanup"   = @{ Name = "Auto Cleanup";    Type = "SERVER"; Port = 0;   Desc = "Hapus file expired" }
 }
 
-# ─── Function: Check Admin ─────────────────────────────────────
+$NSSM_SERVICES = @{
+    "parkir-detectionplate" = @("ParkirDetectionPlate")
+    "parkir-video-recorder" = @("ParkirVideoRecorder")
+    "parkir-qris-display"   = @("QrisDisplay")
+    "parkir-webhook-qris"   = @("ParkirWebhookPHP", "ParkirWebhookTunnel")
+    "parkir-auto-cleanup"   = @("ParkirAutoCleanup")
+}
+
+# ─── Function: Admin Check ─────────────────────────────────────
 function Test-Admin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# ─── Function: Get repo path ───────────────────────────────────
-function Get-RepoPath($repoName) {
-    return Join-Path $BASE_DIR "repos\$repoName"
+# ─── Function: Download Tools ──────────────────────────────────
+function Ensure-NSSM {
+    $nssmPath = Join-Path $TOOLS_DIR "nssm.exe"
+    if (Test-Path $nssmPath) {
+        Write-Host "  ✅ NSSM: $nssmPath" -ForegroundColor Green
+        return $nssmPath
+    }
+
+    Write-Host "  ⬇️  Download NSSM..." -ForegroundColor Cyan
+    New-Item -ItemType Directory -Path $TOOLS_DIR -Force | Out-Null
+
+    $nssmUrl = "https://nssm.cc/release/nssm-2.24.zip"
+    $zipPath = "$env:TEMP\nssm.zip"
+    $extractPath = "$env:TEMP\nssm-extract"
+
+    try {
+        Invoke-WebRequest -Uri $nssmUrl -OutFile $zipPath -UseBasicParsing
+        Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+        Copy-Item "$extractPath\nssm-2.24\win64\nssm.exe" $nssmPath -Force
+        Write-Host "  ✅ NSSM installed: $nssmPath" -ForegroundColor Green
+    } catch {
+        Write-Host "  ❌ Gagal download NSSM: $_" -ForegroundColor Red
+        return $null
+    } finally {
+        Remove-Item $zipPath, $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    return $nssmPath
 }
 
-# ─── Function: Clone or pull repo ──────────────────────────────
+function Ensure-Cloudflared {
+    $cfPath = Join-Path $TOOLS_DIR "cloudflared.exe"
+    if (Test-Path $cfPath) {
+        Write-Host "  ✅ Cloudflared: $cfPath" -ForegroundColor Green
+        return $cfPath
+    }
+
+    Write-Host "  ⬇️  Download Cloudflared..." -ForegroundColor Cyan
+    New-Item -ItemType Directory -Path $TOOLS_DIR -Force | Out-Null
+
+    # Cloudflare tunnel client for Windows AMD64
+    $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+
+    try {
+        Invoke-WebRequest -Uri $cfUrl -OutFile $cfPath -UseBasicParsing
+        Write-Host "  ✅ Cloudflared installed: $cfPath" -ForegroundColor Green
+    } catch {
+        Write-Host "  ⚠️  Gagal download cloudflared: $_" -ForegroundColor Yellow
+        Write-Host "     Download manual: $cfUrl" -ForegroundColor Yellow
+        return $null
+    }
+    return $cfPath
+}
+
+# ─── Function: Repo Path ───────────────────────────────────────
+function Get-RepoPath($repoName) {
+    return Join-Path $BASE_DIR $repoName
+}
+
+# ─── Function: Sync Repo ───────────────────────────────────────
 function Sync-Repo($repoName) {
     $repoPath = Get-RepoPath $repoName
     if (Test-Path $repoPath) {
-        Write-Host "  Updating $repoName..." -ForegroundColor Cyan
-        Push-Location $repoPath
-        git pull 2>&1 | Out-Null
-        Pop-Location
-    } else {
-        Write-Host "  Cloning $repoName..." -ForegroundColor Cyan
-        git clone "https://github.com/$GITHUB_USER/$repoName.git" $repoPath 2>&1 | Out-Null
+        Write-Host "  📂 $repoName sudah ada." -ForegroundColor Yellow
+        Write-Host "     [S]kip  [U]pdate (git pull)  [C]ancel: " -NoNewline
+        $ans = Read-Host
+        switch ($ans.ToUpper()) {
+            "S" { return "skip" }
+            "U" {
+                Write-Host "  🔄 Update $repoName..." -ForegroundColor Cyan
+                Push-Location $repoPath
+                git pull 2>&1 | Out-Null
+                Pop-Location
+                return "updated"
+            }
+            default {
+                Write-Host "  ⛔ Instalasi dibatalkan." -ForegroundColor Red
+                return "cancelled"
+            }
+        }
     }
+
+    Write-Host "  📥 Clone $repoName..." -ForegroundColor Cyan
+    git clone "https://github.com/$GITHUB_USER/$repoName.git" $repoPath 2>&1 | Out-Null
+    return "cloned"
 }
 
-# ─── Function: Install Service ─────────────────────────────────
-function Install-Service($repoName, $nssmPath) {
+# ─── Function: Setup Service ───────────────────────────────────
+function Setup-Service($repoName) {
     $repoPath = Get-RepoPath $repoName
-    $installBat = Join-Path $repoPath "install.bat"
-    
-    if (-not (Test-Path $installBat)) {
-        Write-Host "  ❌ install.bat tidak ditemukan di $repoName" -ForegroundColor Red
-        return $false
+    $info = $REPOS[$repoName]
+
+    Write-Host "  ⚙️  Setup $($info.Name)..." -ForegroundColor Cyan
+
+    # Cek requirements.txt
+    $reqFile = Join-Path $repoPath "requirements.txt"
+    $venvPath = Join-Path $repoPath ".venv"
+
+    if (Test-Path $reqFile) {
+        # Buat venv kalo belum
+        if (-not (Test-Path $venvPath)) {
+            Write-Host "     📦 Membuat virtual environment..." -ForegroundColor Gray
+            & "python" -m venv $venvPath 2>&1 | Out-Null
+        }
+
+        # Install dependencies
+        Write-Host "     📦 Install dependencies..." -ForegroundColor Gray
+        $pip = Join-Path $venvPath "Scripts\pip.exe"
+        if (Test-Path $pip) {
+            & $pip install -r $reqFile --quiet 2>&1 | Out-Null
+        }
     }
-    
-    Write-Host "  ⚙️  Menjalankan installer $repoName..." -ForegroundColor Yellow
-    Push-Location $repoPath
-    & cmd /c $installBat 2>&1 | Write-Host
-    Pop-Location
-    return $true
+
+    # Cek install.bat
+    $installBat = Join-Path $repoPath "install.bat"
+    if (Test-Path $installBat) {
+        Write-Host "     ⚙️  Jalankan install.bat..." -ForegroundColor Gray
+        Push-Location $repoPath
+        & cmd /c $installBat 2>&1 | Out-Null
+        Pop-Location
+        Write-Host "  ✅ $($info.Name) siap!" -ForegroundColor Green
+    } else {
+        Write-Host "  ⚠️  install.bat tidak ditemukan, manual setup diperlukan" -ForegroundColor Yellow
+    }
 }
 
 # ─── Function: Uninstall Service ───────────────────────────────
-$NSSM_SERVICES = @{
-    "parkir-detectionplate" = @("ParkirDetectionPlate")
-    "parkir-video-recorder" = @("ParkirVideoRecorder")
-    "parkir-qris-display"   = @("QrisDisplay")
-    "parkir-webhook-qris"   = @("ParkirWebhookPHP", "ParkirWebhookTunnel")  # PHP + Cloudflare Tunnel
-    "parkir-auto-cleanup"   = @("ParkirAutoCleanup")
-}
-
-function Uninstall-Service($repoName) {
+function Uninstall-Service($repoName, $nssmPath) {
     $serviceNames = $NSSM_SERVICES[$repoName]
     if (-not $serviceNames -or $serviceNames.Count -eq 0) {
-        Write-Host "  ⏭️  $repoName tidak pakai NSSM, skip" -ForegroundColor Yellow
+        Write-Host "  ⏭️  $repoName tidak pakai NSSM" -ForegroundColor Yellow
         return
     }
-    
+
     foreach ($serviceName in $serviceNames) {
-        Write-Host "  🗑️  Menghapus service $serviceName..." -ForegroundColor Red
-        & "C:\nssm\win64\nssm.exe" stop $serviceName 2>&1 | Out-Null
+        Write-Host "  🗑️  Hapus service $serviceName..." -ForegroundColor Red
+        # Stop dulu, ignore error kalo udah mati
+        & $nssmPath stop $serviceName 2>&1 | Out-Null
         Start-Sleep -Milliseconds 500
-        & "C:\nssm\win64\nssm.exe" remove $serviceName confirm 2>&1 | Out-Null
-        Write-Host "  ✅ Service $serviceName dihapus" -ForegroundColor Green
+        & $nssmPath remove $serviceName confirm 2>&1 | Out-Null
+        Write-Host "  ✅ $serviceName dihapus" -ForegroundColor Green
     }
 }
 
-# ─── MENU ───────────────────────────────────────────────────────
-function Show-Menu {
-    Clear-Host
-    Write-Host @"
-╔══════════════════════════════════════════╗
-║     PARKIR SERVICE INSTALLER v1.0       ║
-║     ═══════════════════════════          ║
-║                                          ║
-║  Pilih service yang akan diinstal:       ║
-║                                          ║
-"@ -ForegroundColor Cyan
-    
-    param([ref]$selected)
+# ─── Function: Get Service Selection ───────────────────────────
+function Get-ServiceSelection($mode) {
+    $allRepos = @()
+    $i = 0
+    foreach ($repo in $REPOS.Keys) {
+        $i++
+        $info = $REPOS[$repo]
+        $allRepos += @{ Key = $repo; Index = $i; Name = $info.Name; Type = $info.Type; Desc = $info.Desc }
+    }
+
+    if ($mode -eq "server") {
+        return $allRepos | Where-Object { $_.Type -eq "SERVER" } | ForEach-Object { $_.Key }
+    }
+    if ($mode -eq "client") {
+        return $allRepos | Where-Object { $_.Type -eq "CLIENT" } | ForEach-Object { $_.Key }
+    }
+
+    # Manual mode
+    Write-Host "`nPilih service (pisahkan dengan koma, misal: 1,3,5):" -ForegroundColor Yellow
+    foreach ($r in $allRepos) {
+        Write-Host "  [$($r.Index)] $($r.Name) ($($r.Type)) — $($r.Desc)"
+    }
+    Write-Host "  [A] Semua service" -ForegroundColor Cyan
+    Write-Host "Pilihan: " -NoNewline
+    $choices = Read-Host
+
+    if ($choices.ToUpper() -eq "A") {
+        return $allRepos | ForEach-Object { $_.Key }
+    }
+
+    $selected = @()
+    $choices.Split(",") | ForEach-Object {
+        $idx = $_.Trim() -as [int]
+        $match = $allRepos | Where-Object { $_.Index -eq $idx }
+        if ($match) { $selected += $match.Key }
+    }
+    return $selected
 }
 
 # ─── MAIN ───────────────────────────────────────────────────────
@@ -150,160 +232,169 @@ function Main {
         pause
         exit 1
     }
-    
+
     Clear-Host
     Write-Host @"
 ╔══════════════════════════════════════════╗
-║     PARKIR SERVICE INSTALLER v1.0       ║
+║     PARKIR SERVICE INSTALLER v2.0       ║
 ║     ═══════════════════════════          ║
 ║                                          ║
-║  Master installer untuk semua service    ║
-║  SMARTPARK parking system.               ║
+║  Lokasi: $BASE_DIR
 ║                                          ║
 ╚══════════════════════════════════════════╝
 "@ -ForegroundColor Cyan
-    
-    # Cek NSSM
-    $nssmPath = Ensure-NSSM
-    if (-not $nssmPath) {
-        Write-Host "❌ NSSM diperlukan untuk service management. Install manual." -ForegroundColor Red
-        pause
-        exit 1
-    }
-    
-    # Mode UNINSTALL
+
+    # ── Mode UNINSTALL ──
     if ($Uninstall) {
-        Write-Host "`n🗑️  MODE: UNINSTALL SERVICE`n" -ForegroundColor Red
-        Write-Host "Service yang akan dihapus:" -ForegroundColor Yellow
-        $i = 0
-        $selectedServices = @()
-        foreach ($repo in $REPOS.Keys) {
-            $i++
-            $info = $REPOS[$repo]
-            Write-Host "  [$i] $($info.Name) ($($info.Type))"
-            $selectedServices += $repo
+        Write-Host "`n🗑️  MODE: UNINSTALL`n" -ForegroundColor Red
+
+        # Cari service yang masih terinstal
+        $nssmPath = Join-Path $TOOLS_DIR "nssm.exe"
+        if (-not (Test-Path $nssmPath)) {
+            Write-Host "❌ NSSM tidak ditemukan di $nssmPath" -ForegroundColor Red
+            pause
+            return
         }
-        
-        Write-Host "`nHapus semua? (y/N): " -NoNewline
+
+        $selectedRepos = Get-ServiceSelection "manual"
+
+        Write-Host "`nHapus service-service ini? (y/N): " -NoNewline
         $ans = Read-Host
         if ($ans -eq "y") {
-            foreach ($repo in $selectedServices) {
-                Write-Host "`n➡️  $($REPOS[$repo].Name)" -ForegroundColor Cyan
-                Uninstall-Service $repo
+            foreach ($repo in $selectedRepos) {
+                $info = $REPOS[$repo]
+                Write-Host "`n➡️  $($info.Name)" -ForegroundColor Cyan
+                Uninstall-Service $repo $nssmPath
             }
+            Write-Host "`n✅ Uninstall selesai!" -ForegroundColor Green
         }
-        
-        Write-Host "`n✅ Uninstall selesai!" -ForegroundColor Green
         pause
         return
     }
-    
-    # Mode UPDATE
+
+    # ── Mode UPDATE ──
     if ($Update) {
-        Write-Host "`n🔄 MODE: UPDATE SERVICE`n" -ForegroundColor Cyan
-        
-        foreach ($repo in $REPOS.Keys) {
+        Write-Host "`n🔄 MODE: UPDATE`n" -ForegroundColor Cyan
+
+        $selectedRepos = Get-ServiceSelection "manual"
+
+        foreach ($repo in $selectedRepos) {
             $info = $REPOS[$repo]
-            Write-Host "`n➡️  $($info.Name) ($($info.Type))" -ForegroundColor Cyan
-            Sync-Repo $repo
-            Write-Host "  ✅ $repo updated!" -ForegroundColor Green
-        }
-        
-        Write-Host "`nRestart semua service? (y/N): " -NoNewline
-        $ans = Read-Host
-        if ($ans -eq "y") {
-            foreach ($repo in $REPOS.Keys) {
-                $serviceNames = $NSSM_SERVICES[$repo]
-                if ($serviceNames -and $serviceNames.Count -gt 0) {
-                    foreach ($svc in $serviceNames) {
-                        & $nssmPath restart $svc 2>&1 | Out-Null
-                        Write-Host "  ✅ $svc restarted" -ForegroundColor Green
-                    }
-                }
+            Write-Host "`n➡️  $($info.Name)" -ForegroundColor Cyan
+            $result = Sync-Repo $repo
+            if ($result -eq "cloned" -or $result -eq "updated") {
+                Setup-Service $repo
             }
         }
-        
+
         Write-Host "`n✅ Update selesai!" -ForegroundColor Green
         pause
         return
     }
-    
-    # ─── INSTALL MODE ─────────────────────────────────────────────
-    
-    # Tentukan mode
-    Write-Host @"
-Tipe instalasi:
-  [1] Server (Detection Plate, Webhook QRIS, Auto Cleanup)
-  [2] Client (Video Recorder, QRIS Display)
-  [3] Manual — pilih sendiri
-"@
+
+    # ── Mode INSTALL ──
+
+    # 1. Cek & download tools
+    Write-Host "`n🔧 Memeriksa tools...`n" -ForegroundColor Cyan
+    $nssmPath = Ensure-NSSM
+    if (-not $nssmPath) {
+        Write-Host "❌ NSSM diperlukan. Install manual." -ForegroundColor Red
+        pause
+        exit 1
+    }
+
+    $cfPath = Ensure-Cloudflared
+
+    # 2. Pilih service
+    Write-Host "`n📋 Pilih service`n" -ForegroundColor Cyan
+    Write-Host "Tipe instalasi:" -ForegroundColor Yellow
+    Write-Host "  [1] Server ($(($REPOS.Values | Where-Object { $_.Type -eq "SERVER" }).Count -join ', '))" 
+    Write-Host "  [2] Client" 
+    Write-Host "  [3] Manual — pilih sendiri"
     Write-Host "Pilih [1-3]: " -NoNewline
     $mode = Read-Host
-    
-    $availableRepos = @()
-    switch ($mode) {
-        "1" { $availableRepos = @("parkir-detectionplate", "parkir-webhook-qris", "parkir-auto-cleanup") }
-        "2" { $availableRepos = @("parkir-video-recorder", "parkir-qris-display") }
-        default {
-            # Tampilkan semua
-            Write-Host "`nPilih service (pisahkan dengan koma, misal: 1,3,5):" -ForegroundColor Yellow
-            $i = 0
-            $allRepos = @()
-            foreach ($repo in $REPOS.Keys) {
-                $i++
-                $info = $REPOS[$repo]
-                Write-Host "  [$i] $($info.Name) ($($info.Type))"
-                $allRepos += $repo
-            }
-            Write-Host "Pilihan: " -NoNewline
-            $choices = Read-Host
-            $availableRepos = $choices.Split(",") | ForEach-Object {
-                $idx = $_.Trim() -as [int]
-                if ($idx -gt 0 -and $idx -le $allRepos.Count) { $allRepos[$idx-1] }
-            }
-        }
+
+    $selLabel = switch ($mode) {
+        "1" { "server" }
+        "2" { "client" }
+        default { "manual" }
     }
-    
-    Write-Host "`n📦 Service yang akan diinstal:" -ForegroundColor Cyan
-    foreach ($repo in $availableRepos) {
-        $info = $REPOS[$repo]
-        Write-Host "  ✅ $($info.Name) ($($info.Type))" -ForegroundColor Green
-    }
-    
-    Write-Host "`nMulai instalasi? (y/N): " -NoNewline
-    $ans = Read-Host
-    if ($ans -ne "y") {
-        Write-Host "Dibatalkan."
+
+    $selectedRepos = Get-ServiceSelection $selLabel
+
+    if ($selectedRepos.Count -eq 0) {
+        Write-Host "❌ Tidak ada service dipilih." -ForegroundColor Red
         pause
         return
     }
-    
-    # Clone repos
-    Write-Host "`n📥 Mengunduh repositori..." -ForegroundColor Cyan
-    foreach ($repo in $availableRepos) {
-        Sync-Repo $repo
-    }
-    
-    # Install services
-    Write-Host "`n⚙️  Menginstal service..." -ForegroundColor Cyan
-    foreach ($repo in $availableRepos) {
+
+    Write-Host "`n📦 Service yang akan diinstal:" -ForegroundColor Cyan
+    foreach ($repo in $selectedRepos) {
         $info = $REPOS[$repo]
-        Write-Host "`n➡️  $($info.Name) ($($repo))" -ForegroundColor Cyan
-        Install-Service $repo $nssmPath
+        Write-Host "  ✅ $($info.Name) ($($info.Type)) — $($info.Desc)" -ForegroundColor Green
     }
-    
+
+    Write-Host "`nMulai instalasi? (y/N): " -NoNewline
+    $ans = Read-Host
+    if ($ans -ne "y") {
+        Write-Host "Dibatalkan." -ForegroundColor Yellow
+        pause
+        return
+    }
+
+    # 3. Clone / update repos
+    Write-Host "`n📥 Menyiapkan repositori...`n" -ForegroundColor Cyan
+    $cancelInstall = $false
+    foreach ($repo in $selectedRepos) {
+        $info = $REPOS[$repo]
+        Write-Host "➡️  $($info.Name)" -ForegroundColor Cyan
+        $result = Sync-Repo $repo
+        if ($result -eq "cancelled") {
+            $cancelInstall = $true
+            break
+        }
+    }
+
+    if ($cancelInstall) {
+        Write-Host "`n⛔ Instalasi dibatalkan." -ForegroundColor Red
+        pause
+        return
+    }
+
+    # 4. Setup tiap service
+    Write-Host "`n⚙️  Setup service...`n" -ForegroundColor Cyan
+    foreach ($repo in $selectedRepos) {
+        $info = $REPOS[$repo]
+        Write-Host "➡️  $($info.Name)" -ForegroundColor Cyan
+        Setup-Service $repo
+    }
+
+    # 5. Selesai
     Write-Host @"
 
 ╔══════════════════════════════════════════╗
 ║          INSTALASI SELESAI!              ║
 ║                                          ║
-║  Untuk UPDATE di masa depan,            ║
-║  jalankan: .\install.ps1 -Update        ║
+║  Tools: $TOOLS_DIR
+║  Service: $BASE_DIR
 ║                                          ║
-║  Untuk UNINSTALL:                       ║
-║  jalankan: .\install.ps1 -Uninstall     ║
+║  Untuk UPDATE: .\install.ps1 -Update    ║
+║  Untuk UNINSTALL: .\install.ps1 -Uninstall
 ╚══════════════════════════════════════════╝
 "@ -ForegroundColor Green
+
+    # Info service
+    Write-Host "`n📌 Service yang terinstall:" -ForegroundColor Cyan
+    foreach ($repo in $selectedRepos) {
+        $info = $REPOS[$repo]
+        $svcs = $NSSM_SERVICES[$repo]
+        if ($svcs) {
+            foreach ($svc in $svcs) {
+                Write-Host "  • $svc"
+            }
+        }
+    }
+
     pause
 }
 
